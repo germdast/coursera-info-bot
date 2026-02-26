@@ -227,7 +227,12 @@ WELCOME = (
     "• /learn/... (course)\n"
     "• /specializations/... (specialization)\n"
     "• /professional-certificates/... (professional certificate)\n"
-    "• /programs/.../learn|specializations|professional-certificates/... (program links)\n"
+    "• /programs/.../learn|specializations|professional-certificates/... (program links)\n\n"
+    "Examples:\n"
+    "https://www.coursera.org/professional-certificates/adp-airs-entry-level-recruiter\n"
+    "https://www.coursera.org/specializations/jhu-data-science\n"
+    "https://www.coursera.org/learn/intro-fpga-design-embedded-systems/home/welcome\n\n"
+    "⏳ First request may take up to 1 minute."
 )
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
