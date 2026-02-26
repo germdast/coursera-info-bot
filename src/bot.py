@@ -13,24 +13,16 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ============================
-# Logging (don't leak tokens)
-# ============================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("coursera-course-info-bot")
 
-# Silence noisy loggers (they may print URLs containing the bot token)
 for noisy in ("httpx", "httpcore", "telegram", "telegram.ext"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
-# ============================
-# Render Web Service needs a port
-# ============================
 def start_health_server() -> None:
-    """Render Web Service expects an open TCP port (env PORT)."""
     port = int(os.environ.get("PORT", "10000"))
 
     class Handler(BaseHTTPRequestHandler):
@@ -47,15 +39,12 @@ def start_health_server() -> None:
                 self.wfile.write(b"Not Found")
 
         def log_message(self, format, *args):
-            return  # no access logs
+            return
 
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
 threading.Thread(target=start_health_server, daemon=True).start()
 
-# ============================
-# Coursera parsing (public info only)
-# ============================
 UA = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -64,15 +53,8 @@ UA = {
 }
 
 ALLOWED_PATH_PREFIXES = ("/learn/", "/specializations/", "/professional-certificates/")
-
-# Separators can disappear in extracted text, so we treat them as OPTIONAL.
 SEP_OPT = r"(?:[·•\-–—:]\s*)?"
 
-# Examples:
-# Module 1 · 2 hours to complete
-# Module 1 2 hours to complete
-# Course 1 · 40 hours
-# Course 1 40 hours
 MODULE_HOURS_RE = re.compile(
     rf"Module\s*\d+\s*{SEP_OPT}(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\b(?:\s*to\s*complete)?",
     re.IGNORECASE,
@@ -82,7 +64,6 @@ COURSE_HOURS_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Fuzzy fallback if Coursera inserts extra words between labels and hours
 MODULE_HOURS_FUZZY_RE = re.compile(
     r"Module\s*\d+.{0,60}?(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\b",
     re.IGNORECASE,
@@ -101,10 +82,10 @@ def _extract_first_url(text: str) -> Optional[str]:
     m = re.search(r"https?://\S+", (text or "").strip())
     if not m:
         return None
-    return m.group(0).rstrip(").,]>"'")
+    # ✅ fixed quoting (was SyntaxError in your logs)
+    return m.group(0).rstrip(").,]>\"'")
 
 def normalize_url(text: str) -> Optional[str]:
-    """Also accepts /programs/<program>/... links and canonicalizes them."""
     raw = _extract_first_url(text)
     if not raw:
         return None
@@ -119,10 +100,8 @@ def normalize_url(text: str) -> Optional[str]:
         return None
 
     path = p.path or ""
-    # Strip /programs/<slug>/ prefix if present
     if path.startswith("/programs/"):
         parts = path.split("/")
-        # ['', 'programs', '{program}', 'specializations', 'slug']
         if len(parts) >= 4:
             path = "/" + "/".join(parts[3:])
 
@@ -149,11 +128,6 @@ def _count_matches(pattern: re.Pattern, text: str) -> int:
     return len(list(pattern.finditer(text)))
 
 def parse_workload(url: str, soup: BeautifulSoup) -> Dict[str, Any]:
-    """
-    Requirements:
-      - If /learn/ (course) -> sum module hours.
-      - If /specializations/ or /professional-certificates/ -> sum course hours.
-    """
     page_text = soup.get_text(" ", strip=True)
 
     is_course = "/learn/" in url
@@ -176,7 +150,7 @@ def parse_workload(url: str, soup: BeautifulSoup) -> Dict[str, Any]:
 
         m = GENERIC_HOURS_TO_COMPLETE_RE.search(page_text)
         if m:
-            workload.update({"total_hours": float(m.group(1)), "basis": "hint", "items": None})
+            workload.update({"total_hours": float(m.group(1)), "basis": "hint"})
         return workload
 
     if is_spec or is_pro:
@@ -193,7 +167,7 @@ def parse_workload(url: str, soup: BeautifulSoup) -> Dict[str, Any]:
 
         m = GENERIC_HOURS_TO_COMPLETE_RE.search(page_text)
         if m:
-            workload.update({"total_hours": float(m.group(1)), "basis": "hint", "items": None})
+            workload.update({"total_hours": float(m.group(1)), "basis": "hint"})
         return workload
 
     return workload
@@ -247,9 +221,6 @@ def format_info(info: Dict[str, Any]) -> str:
     lines.append("ℹ️ Bot reads only publicly available information shown on the page.")
     return "\n".join(lines)
 
-# ============================
-# Telegram bot
-# ============================
 WELCOME = (
     "Hi! Send a Coursera link and I will return a short summary.\n\n"
     "Supported:\n"
@@ -273,9 +244,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     url = normalize_url(update.message.text)
     if not url:
-        await update.message.reply_text(
-            "Please send a valid Coursera link (course/specialization/professional-certificate)."
-        )
+        await update.message.reply_text("Please send a valid Coursera link.")
         return
 
     await update.message.reply_text("⏳ Checking the page...")
@@ -292,7 +261,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         }
 
         await update.message.reply_text(format_info(info))
-
     except requests.HTTPError:
         await update.message.reply_text("❌ I could not access this page right now. Please try again later.")
     except Exception:
