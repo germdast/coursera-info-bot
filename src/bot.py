@@ -13,7 +13,6 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-
 # ============================
 # Logging (don't leak tokens)
 # ============================
@@ -23,19 +22,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("coursera-course-info-bot")
 
-# Silence noisy loggers (can include URLs with bot token)
+# Silence noisy loggers (they may print URLs containing the bot token)
 for noisy in ("httpx", "httpcore", "telegram", "telegram.ext"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
-
 
 # ============================
 # Render Web Service needs a port
 # ============================
 def start_health_server() -> None:
-    """
-    Render Web Service expects an open TCP port (env PORT).
-    This tiny server responds with OK for / and /healthz.
-    """
+    """Render Web Service expects an open TCP port (env PORT)."""
     port = int(os.environ.get("PORT", "10000"))
 
     class Handler(BaseHTTPRequestHandler):
@@ -52,16 +47,11 @@ def start_health_server() -> None:
                 self.wfile.write(b"Not Found")
 
         def log_message(self, format, *args):
-            return  # disable access logs
+            return  # no access logs
 
-    httpd = HTTPServer(("0.0.0.0", port), Handler)
-    logger.info("Health server listening on 0.0.0.0:%s", port)
-    httpd.serve_forever()
+    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
-
-# Start health server in background so polling bot can run in main thread
 threading.Thread(target=start_health_server, daemon=True).start()
-
 
 # ============================
 # Coursera parsing (public info only)
@@ -75,40 +65,46 @@ UA = {
 
 ALLOWED_PATH_PREFIXES = ("/learn/", "/specializations/", "/professional-certificates/")
 
-# Patterns:
-# Course page: "Module 1 · 2 hours to complete"
-SEP = r"(?:[·•\-\u2013\u2014]|:)"
+# Separators can disappear in extracted text, so we treat them as OPTIONAL.
+SEP_OPT = r"(?:[·•\-–—:]\s*)?"
+
+# Examples:
+# Module 1 · 2 hours to complete
+# Module 1 2 hours to complete
+# Course 1 · 40 hours
+# Course 1 40 hours
 MODULE_HOURS_RE = re.compile(
-    rf"Module\s*\d+\s*{SEP}\s*(\d+(?:\.\d+)?)\s*hours?\s*to\s*complete",
+    rf"Module\s*\d+\s*{SEP_OPT}(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\b(?:\s*to\s*complete)?",
     re.IGNORECASE,
 )
-# Specialization/ProfCert: "Course 1 · 40 hours"
 COURSE_HOURS_RE = re.compile(
-    rf"Course\s*\d+\s*{SEP}\s*(\d+(?:\.\d+)?)\s*hours?\b",
+    rf"Course\s*\d+\s*{SEP_OPT}(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\b",
     re.IGNORECASE,
-)
-# Fallback: "10 hours to complete"
-GENERIC_HOURS_TO_COMPLETE_RE = re.compile(
-    r"(\d+(?:\.\d+)?)\s*hours?\s*to\s*complete", re.IGNORECASE
 )
 
+# Fuzzy fallback if Coursera inserts extra words between labels and hours
+MODULE_HOURS_FUZZY_RE = re.compile(
+    r"Module\s*\d+.{0,60}?(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\b",
+    re.IGNORECASE,
+)
+COURSE_HOURS_FUZZY_RE = re.compile(
+    r"Course\s*\d+.{0,60}?(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\b",
+    re.IGNORECASE,
+)
+
+GENERIC_HOURS_TO_COMPLETE_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\s*to\s*complete",
+    re.IGNORECASE,
+)
 
 def _extract_first_url(text: str) -> Optional[str]:
     m = re.search(r"https?://\S+", (text or "").strip())
     if not m:
         return None
-    return m.group(0).rstrip(").,]>")
-
+    return m.group(0).rstrip(").,]>"'")
 
 def normalize_url(text: str) -> Optional[str]:
-    """
-    Accept:
-      - https://www.coursera.org/learn/...
-      - https://www.coursera.org/specializations/...
-      - https://www.coursera.org/professional-certificates/...
-      - https://www.coursera.org/programs/<program>/specializations/...
-        -> canonicalize by removing /programs/<program>/
-    """
+    """Also accepts /programs/<program>/... links and canonicalizes them."""
     raw = _extract_first_url(text)
     if not raw:
         return None
@@ -130,20 +126,15 @@ def normalize_url(text: str) -> Optional[str]:
         if len(parts) >= 4:
             path = "/" + "/".join(parts[3:])
 
-    # Ensure supported content types
     if not any(path.startswith(pref) for pref in ALLOWED_PATH_PREFIXES):
         return None
 
-    # Remove query/fragment
-    canon = urlunparse(("https", "www.coursera.org", path.rstrip("/"), "", "", ""))
-    return canon
-
+    return urlunparse(("https", "www.coursera.org", path.rstrip("/"), "", "", ""))
 
 def fetch_html(url: str, timeout: int = 20) -> str:
     r = requests.get(url, headers=UA, timeout=timeout, allow_redirects=True)
     r.raise_for_status()
     return r.text
-
 
 def _sum_matches(pattern: re.Pattern, text: str) -> float:
     total = 0.0
@@ -151,19 +142,17 @@ def _sum_matches(pattern: re.Pattern, text: str) -> float:
         try:
             total += float(m.group(1))
         except Exception:
-            continue
+            pass
     return total
-
 
 def _count_matches(pattern: re.Pattern, text: str) -> int:
     return len(list(pattern.finditer(text)))
 
-
 def parse_workload(url: str, soup: BeautifulSoup) -> Dict[str, Any]:
     """
-    Rules:
-      - If COURSE: sum module hours ("Module X · Y hours to complete")
-      - If SPECIALIZATION or PROFESSIONAL CERTIFICATE: sum course hours ("Course X · Y hours")
+    Requirements:
+      - If /learn/ (course) -> sum module hours.
+      - If /specializations/ or /professional-certificates/ -> sum course hours.
     """
     page_text = soup.get_text(" ", strip=True)
 
@@ -171,40 +160,43 @@ def parse_workload(url: str, soup: BeautifulSoup) -> Dict[str, Any]:
     is_spec = "/specializations/" in url
     is_pro = "/professional-certificates/" in url
 
-    workload: Dict[str, Any] = {
-        "total_hours": None,
-        "basis": None,  # "modules" | "courses" | "hint"
-        "items": None,  # count of modules/courses
-        "raw_hint": None,
-    }
+    workload: Dict[str, Any] = {"total_hours": None, "basis": None, "items": None}
 
     if is_course:
         total = _sum_matches(MODULE_HOURS_RE, page_text)
         count = _count_matches(MODULE_HOURS_RE, page_text)
+
+        if count == 0:
+            total = _sum_matches(MODULE_HOURS_FUZZY_RE, page_text)
+            count = _count_matches(MODULE_HOURS_FUZZY_RE, page_text)
+
         if count > 0 and total > 0:
             workload.update({"total_hours": total, "basis": "modules", "items": count})
             return workload
 
-        # fallback: first mention
         m = GENERIC_HOURS_TO_COMPLETE_RE.search(page_text)
         if m:
-            workload.update({"total_hours": float(m.group(1)), "basis": "hint", "raw_hint": "hours to complete"})
+            workload.update({"total_hours": float(m.group(1)), "basis": "hint", "items": None})
         return workload
 
     if is_spec or is_pro:
         total = _sum_matches(COURSE_HOURS_RE, page_text)
         count = _count_matches(COURSE_HOURS_RE, page_text)
+
+        if count == 0:
+            total = _sum_matches(COURSE_HOURS_FUZZY_RE, page_text)
+            count = _count_matches(COURSE_HOURS_FUZZY_RE, page_text)
+
         if count > 0 and total > 0:
             workload.update({"total_hours": total, "basis": "courses", "items": count})
             return workload
 
         m = GENERIC_HOURS_TO_COMPLETE_RE.search(page_text)
         if m:
-            workload.update({"total_hours": float(m.group(1)), "basis": "hint", "raw_hint": "hours to complete"})
+            workload.update({"total_hours": float(m.group(1)), "basis": "hint", "items": None})
         return workload
 
     return workload
-
 
 def parse_title(soup: BeautifulSoup) -> str:
     og = soup.find("meta", property="og:title")
@@ -214,7 +206,6 @@ def parse_title(soup: BeautifulSoup) -> str:
         return soup.title.text.strip()
     return "Coursera"
 
-
 def page_type(url: str) -> str:
     if "/specializations/" in url:
         return "Specialization"
@@ -222,14 +213,12 @@ def page_type(url: str) -> str:
         return "Professional Certificate"
     return "Course"
 
-
 def fmt_hours(x: float) -> str:
     if x is None:
         return "-"
     if abs(x - round(x)) < 1e-9:
         return str(int(round(x)))
     return f"{x:.1f}"
-
 
 def format_info(info: Dict[str, Any]) -> str:
     title = info.get("title") or "Coursera"
@@ -245,11 +234,9 @@ def format_info(info: Dict[str, Any]) -> str:
 
     if total is not None:
         if wl.get("basis") == "modules":
-            items = wl.get("items")
-            lines.append(f"Total hours: {fmt_hours(total)} (sum of {items} modules)")
+            lines.append(f"Total hours: {fmt_hours(total)} (sum of {wl.get('items')} modules)")
         elif wl.get("basis") == "courses":
-            items = wl.get("items")
-            lines.append(f"Total hours: {fmt_hours(total)} (sum of {items} courses)")
+            lines.append(f"Total hours: {fmt_hours(total)} (sum of {wl.get('items')} courses)")
         else:
             lines.append(f"Total hours: {fmt_hours(total)} (mentioned on page)")
     else:
@@ -259,7 +246,6 @@ def format_info(info: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("ℹ️ Bot reads only publicly available information shown on the page.")
     return "\n".join(lines)
-
 
 # ============================
 # Telegram bot
@@ -273,20 +259,18 @@ WELCOME = (
     "• /programs/.../learn|specializations|professional-certificates/... (program links)\n"
 )
 
-
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         await update.message.reply_text(WELCOME)
-
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         await update.message.reply_text(WELCOME)
 
-
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
+
     url = normalize_url(update.message.text)
     if not url:
         await update.message.reply_text(
@@ -315,7 +299,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.exception("Unexpected error while parsing")
         await update.message.reply_text("❌ Something went wrong while parsing the page.")
 
-
 def main() -> None:
     load_dotenv()
     token = os.environ.get("TELEGRAM_TOKEN")
@@ -329,7 +312,6 @@ def main() -> None:
 
     logger.info("Bot started")
     app.run_polling(close_loop=False)
-
 
 if __name__ == "__main__":
     main()
