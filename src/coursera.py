@@ -22,32 +22,34 @@ _ALLOWED_PREFIXES = {
     "projects": "project",
 }
 
-
 # ----------------------------
 # Workload patterns (best-effort)
 # ----------------------------
-# Separators may disappear in soup.get_text; treat as optional.
+# separators may disappear in soup.get_text -> optional
 SEP_OPT = r"(?:[·•\-\u2013\u2014:]\s*)?"
 
-# Examples:
-# "Module 1 · 2 hours to complete"
-# "Module 1 2 hours to complete"
-MODULE_HOURS_RE = re.compile(
-    rf"Module\s*\d+\s*{SEP_OPT}(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\b(?:\s*to\s*complete)?",
+# strict-ish patterns
+MODULE_STRICT_RE = re.compile(
+    rf"Module\s*\d+\s*{SEP_OPT}(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?)\b(?:\s*to\s*complete)?",
+    re.IGNORECASE,
+)
+COURSE_STRICT_RE = re.compile(
+    rf"Course\s*\d+\s*{SEP_OPT}(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?)\b",
     re.IGNORECASE,
 )
 
-# Examples:
-# "Course 1 · 40 hours"
-# "Course 1 40 hours"
-COURSE_HOURS_RE = re.compile(
-    rf"Course\s*\d+\s*{SEP_OPT}(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\b",
+# fuzzy fallbacks if Coursera inserts words between label and duration
+MODULE_FUZZY_RE = re.compile(
+    r"Module\s*\d+.{0,80}?(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?)\b",
+    re.IGNORECASE,
+)
+COURSE_FUZZY_RE = re.compile(
+    r"Course\s*\d+.{0,80}?(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?)\b",
     re.IGNORECASE,
 )
 
-# Fallback:
 GENERIC_HOURS_TO_COMPLETE_RE = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\s*to\s*complete",
+    r"(\d+(?:\.\d+)?)\s*(hours?|hrs?)\s*to\s*complete",
     re.IGNORECASE,
 )
 
@@ -68,25 +70,22 @@ class CourseInfo:
 
 
 # ----------------------------
-# URL Canonicalization (THIS fixes /home/welcome etc.)
+# URL handling
 # ----------------------------
-def canonicalize_url(url: str) -> Optional[str]:
+def _strip_query_fragment(u: str) -> str:
+    p = urlparse(u)
+    return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
+
+
+def sanitize_fetch_url(url: str) -> Optional[str]:
     """
-    Accepts:
-      - https://www.coursera.org/learn/<slug>/home/welcome
-      - https://www.coursera.org/learn/<slug>/home/week/1
-      - https://www.coursera.org/specializations/<slug>/...
-      - https://www.coursera.org/professional-certificates/<slug>/...
-      - https://www.coursera.org/programs/<program>/<type>/<slug>/...
-    Returns canonical:
-      https://www.coursera.org/<type>/<slug>
+    Keeps extra path like /home/welcome (important for some courses),
+    but removes query/fragment and handles /programs/<program>/ prefix.
     """
     if not url:
         return None
 
     url = url.strip()
-
-    # If text contains multiple things, take the first URL
     m = re.search(r"https?://\S+", url)
     if m:
         url = m.group(0).rstrip(").,]>'\"")
@@ -102,24 +101,36 @@ def canonicalize_url(url: str) -> Optional[str]:
 
     path = p.path or ""
 
-    # Strip /programs/<program>/ prefix
+    # strip /programs/<program>/ prefix but keep the rest of path (including /home/welcome)
     if path.startswith("/programs/"):
         parts = path.split("/")
         # ['', 'programs', '{program}', '<type>', '<slug>', ...]
         if len(parts) >= 5:
             path = "/" + "/".join(parts[3:])
 
-    # Take only first 2 path segments: /<type>/<slug>
-    parts = [x for x in path.split("/") if x]
-    if len(parts) < 2:
+    # ensure starts with supported prefix
+    seg = [x for x in path.split("/") if x]
+    if len(seg) < 2:
+        return None
+    if seg[0] not in _ALLOWED_PREFIXES:
         return None
 
-    prefix, slug = parts[0], parts[1]
-    if prefix not in _ALLOWED_PREFIXES:
-        return None
+    # keep full remaining path (home/welcome/etc), drop query/fragment
+    return urlunparse(("https", "www.coursera.org", path.rstrip("/"), "", "", ""))
 
-    base_path = f"/{prefix}/{slug}"
-    # Drop query + fragment always
+
+def canonicalize_url(url: str) -> Optional[str]:
+    """
+    Canonical for dedupe/display: keep only first 2 segments /<type>/<slug>.
+    """
+    fetch_u = sanitize_fetch_url(url)
+    if not fetch_u:
+        return None
+    p = urlparse(fetch_u)
+    seg = [x for x in (p.path or "").split("/") if x]
+    if len(seg) < 2:
+        return None
+    base_path = f"/{seg[0]}/{seg[1]}"
     return urlunparse(("https", "www.coursera.org", base_path, "", "", ""))
 
 
@@ -127,12 +138,11 @@ def detect_kind(url: str) -> Optional[str]:
     cu = canonicalize_url(url)
     if not cu:
         return None
-    path = urlparse(cu).path
-    parts = [x for x in path.split("/") if x]
-    if len(parts) < 2:
+    p = urlparse(cu)
+    seg = [x for x in (p.path or "").split("/") if x]
+    if not seg:
         return None
-    prefix = parts[0]
-    return _ALLOWED_PREFIXES.get(prefix)
+    return _ALLOWED_PREFIXES.get(seg[0])
 
 
 def is_supported_coursera_url(url: str) -> bool:
@@ -140,7 +150,7 @@ def is_supported_coursera_url(url: str) -> bool:
 
 
 # ----------------------------
-# HTTP session with retries (Render/network safe)
+# HTTP session with retries
 # ----------------------------
 _session: Optional[requests.Session] = None
 
@@ -202,7 +212,6 @@ def parse_description(soup: BeautifulSoup) -> Optional[str]:
 
 
 def parse_course_count(text: str) -> Optional[int]:
-    # Best-effort: specialization/pro-cert often mentions number of courses
     m = re.search(r"(\d{1,2})\s+course\s+series", text, re.IGNORECASE)
     if m:
         return int(m.group(1))
@@ -233,12 +242,21 @@ def parse_workload_hint(text: str) -> Optional[str]:
     return ", ".join(parts) if parts else None
 
 
-def _sum_matches(pattern: re.Pattern, text: str) -> Tuple[Optional[float], int]:
+def _to_hours(value: float, unit: str) -> float:
+    u = unit.lower()
+    if u.startswith("min"):
+        return value / 60.0
+    return value
+
+
+def _sum_duration_matches(pattern: re.Pattern, text: str) -> Tuple[Optional[float], int]:
     total = 0.0
     count = 0
     for m in pattern.finditer(text):
         try:
-            total += float(m.group(1))
+            val = float(m.group(1))
+            unit = m.group(2)
+            total += _to_hours(val, unit)
             count += 1
         except Exception:
             pass
@@ -247,27 +265,28 @@ def _sum_matches(pattern: re.Pattern, text: str) -> Tuple[Optional[float], int]:
     return total, count
 
 
-def _try_next_data_hours(soup: BeautifulSoup) -> Optional[float]:
+def _try_next_data_sum(kind: str, soup: BeautifulSoup) -> Tuple[Optional[float], int]:
     """
-    Best-effort fallback: look into __NEXT_DATA__ JSON.
-    Coursera structure changes часто, поэтому делаем очень осторожно.
+    Very best-effort: apply the same regex on __NEXT_DATA__ JSON string.
+    Sometimes syllabus appears there even if not in visible text.
     """
     script = soup.find("script", id="__NEXT_DATA__")
     if not script or not script.string:
-        return None
+        return None, 0
+
     try:
         data = json.loads(script.string)
     except Exception:
-        return None
+        return None, 0
 
     blob = json.dumps(data)
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\s*to\s*complete", blob, re.IGNORECASE)
-    if m:
-        try:
-            return float(m.group(1))
-        except Exception:
-            return None
-    return None
+    if kind == "course":
+        total, count = _sum_duration_matches(MODULE_FUZZY_RE, blob)
+        return total, count
+    if kind in {"specialization", "professional_certificate"}:
+        total, count = _sum_duration_matches(COURSE_FUZZY_RE, blob)
+        return total, count
+    return None, 0
 
 
 def parse_total_hours(kind: str, soup: BeautifulSoup) -> Tuple[Optional[float], Optional[str], Optional[int]]:
@@ -279,24 +298,31 @@ def parse_total_hours(kind: str, soup: BeautifulSoup) -> Tuple[Optional[float], 
     text = soup.get_text(" ", strip=True)
 
     if kind == "course":
-        total, count = _sum_matches(MODULE_HOURS_RE, text)
-        if total is not None:
+        total, count = _sum_duration_matches(MODULE_STRICT_RE, text)
+        if total is None:
+            total, count = _sum_duration_matches(MODULE_FUZZY_RE, text)
+
+        if total is None:
+            total, count = _try_next_data_sum(kind, soup)
+
+        if total is not None and count > 0:
             return total, "modules", count
 
     if kind in {"specialization", "professional_certificate"}:
-        total, count = _sum_matches(COURSE_HOURS_RE, text)
-        if total is not None:
+        total, count = _sum_duration_matches(COURSE_STRICT_RE, text)
+        if total is None:
+            total, count = _sum_duration_matches(COURSE_FUZZY_RE, text)
+
+        if total is None:
+            total, count = _try_next_data_sum(kind, soup)
+
+        if total is not None and count > 0:
             return total, "courses", count
 
     # fallback: "X hours to complete"
     m = GENERIC_HOURS_TO_COMPLETE_RE.search(text)
     if m:
         return float(m.group(1)), "hint", None
-
-    # fallback #2: __NEXT_DATA__
-    total2 = _try_next_data_hours(soup)
-    if total2 is not None:
-        return total2, "hint", None
 
     return None, None, None
 
@@ -305,27 +331,39 @@ def parse_total_hours(kind: str, soup: BeautifulSoup) -> Tuple[Optional[float], 
 # Public API
 # ----------------------------
 def get_course_info(url: str) -> CourseInfo:
-    cu = canonicalize_url(url) or url
-    kind = detect_kind(cu) or "unknown"
+    # For parsing/output we use canonical. For fetching we prefer the original (keeps /home/welcome).
+    fetch_url = sanitize_fetch_url(url)
+    canonical = canonicalize_url(url) or url
+    kind = detect_kind(url) or "unknown"
 
+    # Try fetch original first (better chance to see full syllabus)
+    html = None
     try:
-        html = fetch_html(cu)
+        if fetch_url:
+            html = fetch_html(fetch_url)
+    except Exception:
+        html = None
+
+    # Fallback to canonical marketing page
+    try:
+        if html is None:
+            html = fetch_html(canonical)
         soup = BeautifulSoup(html, "lxml")
 
         title = parse_title(soup)
         desc = parse_description(soup)
 
-        text = soup.get_text(" ", strip=True)
-        workload_hint = parse_workload_hint(text)
+        txt = soup.get_text(" ", strip=True)
+        workload_hint = parse_workload_hint(txt)
 
         course_count = None
         if kind in {"specialization", "professional_certificate"}:
-            course_count = parse_course_count(text)
+            course_count = parse_course_count(txt)
 
         total, basis, items = parse_total_hours(kind, soup)
 
         return CourseInfo(
-            url=cu,
+            url=canonical,
             kind=kind,
             title=title,
             description=desc,
@@ -336,5 +374,4 @@ def get_course_info(url: str) -> CourseInfo:
             items_count=items,
         )
     except Exception:
-        # Minimal info if parsing fails
-        return CourseInfo(url=cu, kind=kind)
+        return CourseInfo(url=canonical, kind=kind)
