@@ -3,7 +3,8 @@ import re
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, List
+from urllib.parse import urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -12,27 +13,28 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ----------------------------
-# Logging (важно: не светим токен)
-# ----------------------------
+
+# ============================
+# Logging (don't leak tokens)
+# ============================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("coursera-course-info-bot")
 
-# Отключаем подробные логи httpx/telegram, где может появляться URL с токеном
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
-logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+# Silence noisy loggers (can include URLs with bot token)
+for noisy in ("httpx", "httpcore", "telegram", "telegram.ext"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
-# ----------------------------
-# Render healthcheck (открывает порт)
-# ----------------------------
+
+# ============================
+# Render Web Service needs a port
+# ============================
 def start_health_server() -> None:
     """
-    Render Web Service ожидает открытый порт ($PORT).
-    Этот сервер просто отвечает "OK" на / и /healthz.
+    Render Web Service expects an open TCP port (env PORT).
+    This tiny server responds with OK for / and /healthz.
     """
     port = int(os.environ.get("PORT", "10000"))
 
@@ -49,153 +51,285 @@ def start_health_server() -> None:
                 self.end_headers()
                 self.wfile.write(b"Not Found")
 
-        # отключаем стандартные access-логи
         def log_message(self, format, *args):
-            return
+            return  # disable access logs
 
-    HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    httpd = HTTPServer(("0.0.0.0", port), Handler)
+    logger.info("Health server listening on 0.0.0.0:%s", port)
+    httpd.serve_forever()
 
-# Стартуем healthcheck в фоне, чтобы Render был доволен
+
+# Start health server in background so polling bot can run in main thread
 threading.Thread(target=start_health_server, daemon=True).start()
 
-# ----------------------------
-# Utils: Coursera page parsing (только публичная информация)
-# ----------------------------
-COURSE_URL_RE = re.compile(r"^https?://(www\.)?coursera\.org/(learn|specializations|professional-certificates)/[A-Za-z0-9\-_]+")
 
+# ============================
+# Coursera parsing (public info only)
+# ============================
 UA = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120 Safari/537.36"
+    )
 }
 
-def normalize_url(text: str) -> Optional[str]:
-    text = (text or "").strip()
-    # вытащим первую ссылку из текста
-    m = re.search(r"https?://\S+", text)
-    if not m:
-        return None
-    url = m.group(0).rstrip(").,]")
-    if not COURSE_URL_RE.match(url):
-        return None
-    return url
+ALLOWED_PATH_PREFIXES = ("/learn/", "/specializations/", "/professional-certificates/")
 
-def fetch_html(url: str, timeout: int = 15) -> str:
-    resp = requests.get(url, headers=UA, timeout=timeout)
-    resp.raise_for_status()
-    return resp.text
-
-def parse_course_info(url: str, html: str) -> Dict[str, Any]:
-    """
-    Пытаемся достать базовые поля со страницы Coursera.
-    Coursera меняет верстку, поэтому делаем максимально "гибко".
-    """
-    soup = BeautifulSoup(html, "lxml")
-
-    title = None
-    # 1) OpenGraph
-    og = soup.find("meta", property="og:title")
-    if og and og.get("content"):
-        title = og["content"].strip()
-    # 2) <title>
-    if not title and soup.title and soup.title.text:
-        title = soup.title.text.strip()
-
-    # тип страницы по URL
-    kind = "Course"
-    if "/specializations/" in url:
-        kind = "Specialization"
-    elif "/professional-certificates/" in url:
-        kind = "Professional Certificate"
-    elif "/learn/" in url:
-        kind = "Course"
-
-    # Примерные “оценки” по нагрузке/неделям — если есть в тексте
-    text = soup.get_text(" ", strip=True)
-    workload = None
-    # часто встречается "X hours" / "X hours per week" / "Approx. X hours"
-    m = re.search(r"(\d+)\s*(hour|hours)\b", text, re.IGNORECASE)
-    if m:
-        workload = f"{m.group(1)} hours (mentioned on page)"
-
-    # кол-во курсов (для specialization) — иногда в JSON-LD или тексте
-    course_count = None
-    if kind in ("Specialization", "Professional Certificate"):
-        m2 = re.search(r"(\d+)\s*(course|courses)\b", text, re.IGNORECASE)
-        if m2:
-            course_count = int(m2.group(1))
-
-    return {
-        "title": title or "Coursera page",
-        "type": kind,
-        "workload_hint": workload,
-        "course_count_hint": course_count,
-        "url": url
-    }
-
-def format_info(info: Dict[str, Any]) -> str:
-    lines = []
-    lines.append(f"✅ {info.get('title', 'Coursera page')}")
-    lines.append(f"Type: {info.get('type', '-')}")
-    if info.get("course_count_hint"):
-        lines.append(f"Courses (hint): {info['course_count_hint']}")
-    if info.get("workload_hint"):
-        lines.append(f"Workload (hint): {info['workload_hint']}")
-    lines.append(f"Link: {info.get('url','')}")
-    lines.append("")
-    lines.append("ℹ️ I read only publicly available info from the page.")
-    return "\n".join(lines)
-
-# ----------------------------
-# Telegram handlers
-# ----------------------------
-WELCOME = (
-    "Hi! Send me a Coursera course/specialization link and I will return a short info summary.\n\n"
-    "Examples:\n"
-    "https://www.coursera.org/learn/python\n"
-    "https://www.coursera.org/specializations/machine-learning\n"
+# Patterns:
+# Course page: "Module 1 · 2 hours to complete"
+SEP = r"(?:[·•\-\u2013\u2014]|:)"
+MODULE_HOURS_RE = re.compile(
+    rf"Module\s*\d+\s*{SEP}\s*(\d+(?:\.\d+)?)\s*hours?\s*to\s*complete",
+    re.IGNORECASE,
+)
+# Specialization/ProfCert: "Course 1 · 40 hours"
+COURSE_HOURS_RE = re.compile(
+    rf"Course\s*\d+\s*{SEP}\s*(\d+(?:\.\d+)?)\s*hours?\b",
+    re.IGNORECASE,
+)
+# Fallback: "10 hours to complete"
+GENERIC_HOURS_TO_COMPLETE_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*hours?\s*to\s*complete", re.IGNORECASE
 )
 
+
+def _extract_first_url(text: str) -> Optional[str]:
+    m = re.search(r"https?://\S+", (text or "").strip())
+    if not m:
+        return None
+    return m.group(0).rstrip(").,]>")
+
+
+def normalize_url(text: str) -> Optional[str]:
+    """
+    Accept:
+      - https://www.coursera.org/learn/...
+      - https://www.coursera.org/specializations/...
+      - https://www.coursera.org/professional-certificates/...
+      - https://www.coursera.org/programs/<program>/specializations/...
+        -> canonicalize by removing /programs/<program>/
+    """
+    raw = _extract_first_url(text)
+    if not raw:
+        return None
+
+    try:
+        p = urlparse(raw)
+    except Exception:
+        return None
+
+    host = (p.netloc or "").lower()
+    if not host.endswith("coursera.org"):
+        return None
+
+    path = p.path or ""
+    # Strip /programs/<slug>/ prefix if present
+    if path.startswith("/programs/"):
+        parts = path.split("/")
+        # ['', 'programs', '{program}', 'specializations', 'slug']
+        if len(parts) >= 4:
+            path = "/" + "/".join(parts[3:])
+
+    # Ensure supported content types
+    if not any(path.startswith(pref) for pref in ALLOWED_PATH_PREFIXES):
+        return None
+
+    # Remove query/fragment
+    canon = urlunparse(("https", "www.coursera.org", path.rstrip("/"), "", "", ""))
+    return canon
+
+
+def fetch_html(url: str, timeout: int = 20) -> str:
+    r = requests.get(url, headers=UA, timeout=timeout, allow_redirects=True)
+    r.raise_for_status()
+    return r.text
+
+
+def _sum_matches(pattern: re.Pattern, text: str) -> float:
+    total = 0.0
+    for m in pattern.finditer(text):
+        try:
+            total += float(m.group(1))
+        except Exception:
+            continue
+    return total
+
+
+def _count_matches(pattern: re.Pattern, text: str) -> int:
+    return len(list(pattern.finditer(text)))
+
+
+def parse_workload(url: str, soup: BeautifulSoup) -> Dict[str, Any]:
+    """
+    Rules:
+      - If COURSE: sum module hours ("Module X · Y hours to complete")
+      - If SPECIALIZATION or PROFESSIONAL CERTIFICATE: sum course hours ("Course X · Y hours")
+    """
+    page_text = soup.get_text(" ", strip=True)
+
+    is_course = "/learn/" in url
+    is_spec = "/specializations/" in url
+    is_pro = "/professional-certificates/" in url
+
+    workload: Dict[str, Any] = {
+        "total_hours": None,
+        "basis": None,  # "modules" | "courses" | "hint"
+        "items": None,  # count of modules/courses
+        "raw_hint": None,
+    }
+
+    if is_course:
+        total = _sum_matches(MODULE_HOURS_RE, page_text)
+        count = _count_matches(MODULE_HOURS_RE, page_text)
+        if count > 0 and total > 0:
+            workload.update({"total_hours": total, "basis": "modules", "items": count})
+            return workload
+
+        # fallback: first mention
+        m = GENERIC_HOURS_TO_COMPLETE_RE.search(page_text)
+        if m:
+            workload.update({"total_hours": float(m.group(1)), "basis": "hint", "raw_hint": "hours to complete"})
+        return workload
+
+    if is_spec or is_pro:
+        total = _sum_matches(COURSE_HOURS_RE, page_text)
+        count = _count_matches(COURSE_HOURS_RE, page_text)
+        if count > 0 and total > 0:
+            workload.update({"total_hours": total, "basis": "courses", "items": count})
+            return workload
+
+        m = GENERIC_HOURS_TO_COMPLETE_RE.search(page_text)
+        if m:
+            workload.update({"total_hours": float(m.group(1)), "basis": "hint", "raw_hint": "hours to complete"})
+        return workload
+
+    return workload
+
+
+def parse_title(soup: BeautifulSoup) -> str:
+    og = soup.find("meta", property="og:title")
+    if og and og.get("content"):
+        return og["content"].strip()
+    if soup.title and soup.title.text:
+        return soup.title.text.strip()
+    return "Coursera"
+
+
+def page_type(url: str) -> str:
+    if "/specializations/" in url:
+        return "Specialization"
+    if "/professional-certificates/" in url:
+        return "Professional Certificate"
+    return "Course"
+
+
+def fmt_hours(x: float) -> str:
+    if x is None:
+        return "-"
+    if abs(x - round(x)) < 1e-9:
+        return str(int(round(x)))
+    return f"{x:.1f}"
+
+
+def format_info(info: Dict[str, Any]) -> str:
+    title = info.get("title") or "Coursera"
+    kind = info.get("type") or "-"
+    url = info.get("url") or ""
+
+    lines: List[str] = []
+    lines.append(f"✅ {title}")
+    lines.append(f"Type: {kind}")
+
+    wl = info.get("workload") or {}
+    total = wl.get("total_hours")
+
+    if total is not None:
+        if wl.get("basis") == "modules":
+            items = wl.get("items")
+            lines.append(f"Total hours: {fmt_hours(total)} (sum of {items} modules)")
+        elif wl.get("basis") == "courses":
+            items = wl.get("items")
+            lines.append(f"Total hours: {fmt_hours(total)} (sum of {items} courses)")
+        else:
+            lines.append(f"Total hours: {fmt_hours(total)} (mentioned on page)")
+    else:
+        lines.append("Total hours: - (not found)")
+
+    lines.append(f"Link: {url}")
+    lines.append("")
+    lines.append("ℹ️ Bot reads only publicly available information shown on the page.")
+    return "\n".join(lines)
+
+
+# ============================
+# Telegram bot
+# ============================
+WELCOME = (
+    "Hi! Send a Coursera link and I will return a short summary.\n\n"
+    "Supported:\n"
+    "• /learn/... (course)\n"
+    "• /specializations/... (specialization)\n"
+    "• /professional-certificates/... (professional certificate)\n"
+    "• /programs/.../learn|specializations|professional-certificates/... (program links)\n"
+)
+
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(WELCOME)
+    if update.message:
+        await update.message.reply_text(WELCOME)
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(WELCOME)
+    if update.message:
+        await update.message.reply_text(WELCOME)
+
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.message.text if update.message else ""
-    url = normalize_url(msg)
+    if not update.message:
+        return
+    url = normalize_url(update.message.text)
     if not url:
-        await update.message.reply_text("Please send a valid Coursera link (course/specialization/professional-certificate).")
+        await update.message.reply_text(
+            "Please send a valid Coursera link (course/specialization/professional-certificate)."
+        )
         return
 
     await update.message.reply_text("⏳ Checking the page...")
 
     try:
         html = fetch_html(url)
-        info = parse_course_info(url, html)
+        soup = BeautifulSoup(html, "lxml")
+
+        info = {
+            "title": parse_title(soup),
+            "type": page_type(url),
+            "url": url,
+            "workload": parse_workload(url, soup),
+        }
+
         await update.message.reply_text(format_info(info))
-    except requests.HTTPError as e:
-        logger.warning("HTTPError: %s", str(e))
+
+    except requests.HTTPError:
         await update.message.reply_text("❌ I could not access this page right now. Please try again later.")
-    except Exception as e:
-        logger.exception("Unexpected error: %s", str(e))
+    except Exception:
+        logger.exception("Unexpected error while parsing")
         await update.message.reply_text("❌ Something went wrong while parsing the page.")
+
 
 def main() -> None:
     load_dotenv()
-
     token = os.environ.get("TELEGRAM_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_TOKEN is not set. Add it in Render Environment Variables.")
 
     app = Application.builder().token(token).build()
-
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Bot started")
-    # polling (подходит для Render)
     app.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
     main()
