@@ -1,6 +1,7 @@
 # Coursera Course Info Bot (Telegram)
 
 A small **Telegram bot in Python** that reads **publicly available information** from Coursera course pages and returns a quick overview (title, type, estimated workload, and—when possible—the number of courses in a specialization).
+
 https://t.me/courserainfobot
 
 ✅ **What this project is**
