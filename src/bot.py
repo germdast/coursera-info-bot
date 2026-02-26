@@ -1,28 +1,46 @@
+from __future__ import annotations
+
+import asyncio
+import logging
 import os
 import re
-import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Optional, Dict, Any, List
-from urllib.parse import urlparse, urlunparse
 
-import requests
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.constants import ParseMode
+from telegram.error import Conflict, NetworkError, TimedOut, RetryAfter, BadRequest
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
+from .coursera import CourseInfo, canonicalize_url, get_course_info, is_supported_coursera_url
+from .text import START_TEXT, HELP_TEXT
+
+# ----------------------------
+# Logging (avoid token leaks)
+# ----------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger("coursera-course-info-bot")
+logger = logging.getLogger("coursera-info-bot")
 
+# Silence noisy libs that may print URLs (bot token can appear inside)
 for noisy in ("httpx", "httpcore", "telegram", "telegram.ext"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
-def start_health_server() -> None:
+
+# ----------------------------
+# Render / Web Service port helper (human-factor resilient)
+# If we ever fall back to polling on Render, this keeps the port open.
+# ----------------------------
+def _start_health_server() -> None:
     port = int(os.environ.get("PORT", "10000"))
 
     class Handler(BaseHTTPRequestHandler):
@@ -43,243 +61,195 @@ def start_health_server() -> None:
 
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()
 
-threading.Thread(target=start_health_server, daemon=True).start()
 
-UA = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120 Safari/537.36"
-    )
-}
+# ----------------------------
+# Runtime settings
+# ----------------------------
+MAX_URLS_PER_MESSAGE = int(os.environ.get("MAX_URLS_PER_MESSAGE", "3"))
+FETCH_CONCURRENCY = int(os.environ.get("FETCH_CONCURRENCY", "3"))
+FETCH_TIMEOUT_SEC = int(os.environ.get("FETCH_TIMEOUT_SEC", "25"))
+_fetch_sem = asyncio.Semaphore(FETCH_CONCURRENCY)
 
-ALLOWED_PATH_PREFIXES = ("/learn/", "/specializations/", "/professional-certificates/")
-SEP_OPT = r"(?:[·•\-–—:]\s*)?"
 
-MODULE_HOURS_RE = re.compile(
-    rf"Module\s*\d+\s*{SEP_OPT}(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\b(?:\s*to\s*complete)?",
-    re.IGNORECASE,
-)
-COURSE_HOURS_RE = re.compile(
-    rf"Course\s*\d+\s*{SEP_OPT}(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\b",
-    re.IGNORECASE,
-)
+def escape_html(s: str) -> str:
+    import html as _html
+    return _html.escape(s or "", quote=True)
 
-MODULE_HOURS_FUZZY_RE = re.compile(
-    r"Module\s*\d+.{0,60}?(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\b",
-    re.IGNORECASE,
-)
-COURSE_HOURS_FUZZY_RE = re.compile(
-    r"Course\s*\d+.{0,60}?(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\b",
-    re.IGNORECASE,
-)
 
-GENERIC_HOURS_TO_COMPLETE_RE = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)\s*to\s*complete",
-    re.IGNORECASE,
-)
+def format_info(info: CourseInfo) -> str:
+    kind_map = {
+        "course": "Course",
+        "specialization": "Specialization",
+        "professional_certificate": "Professional Certificate",
+        "project": "Guided Project",
+        "unknown": "Coursera link",
+    }
 
-def _extract_first_url(text: str) -> Optional[str]:
-    m = re.search(r"https?://\S+", (text or "").strip())
-    if not m:
-        return None
-    # ✅ fixed quoting (was SyntaxError in your logs)
-    return m.group(0).rstrip(").,]>\"'")
+    parts = ["<b>Coursera summary</b>"]
+    if info.title:
+        parts.append(f"<b>Title:</b> {escape_html(info.title)}")
+    parts.append(f"<b>Type:</b> {escape_html(kind_map.get(info.kind, info.kind))}")
 
-def normalize_url(text: str) -> Optional[str]:
-    raw = _extract_first_url(text)
-    if not raw:
-        return None
-
-    try:
-        p = urlparse(raw)
-    except Exception:
-        return None
-
-    host = (p.netloc or "").lower()
-    if not host.endswith("coursera.org"):
-        return None
-
-    path = p.path or ""
-    if path.startswith("/programs/"):
-        parts = path.split("/")
-        if len(parts) >= 4:
-            path = "/" + "/".join(parts[3:])
-
-    if not any(path.startswith(pref) for pref in ALLOWED_PATH_PREFIXES):
-        return None
-
-    return urlunparse(("https", "www.coursera.org", path.rstrip("/"), "", "", ""))
-
-def fetch_html(url: str, timeout: int = 20) -> str:
-    r = requests.get(url, headers=UA, timeout=timeout, allow_redirects=True)
-    r.raise_for_status()
-    return r.text
-
-def _sum_matches(pattern: re.Pattern, text: str) -> float:
-    total = 0.0
-    for m in pattern.finditer(text):
-        try:
-            total += float(m.group(1))
-        except Exception:
-            pass
-    return total
-
-def _count_matches(pattern: re.Pattern, text: str) -> int:
-    return len(list(pattern.finditer(text)))
-
-def parse_workload(url: str, soup: BeautifulSoup) -> Dict[str, Any]:
-    page_text = soup.get_text(" ", strip=True)
-
-    is_course = "/learn/" in url
-    is_spec = "/specializations/" in url
-    is_pro = "/professional-certificates/" in url
-
-    workload: Dict[str, Any] = {"total_hours": None, "basis": None, "items": None}
-
-    if is_course:
-        total = _sum_matches(MODULE_HOURS_RE, page_text)
-        count = _count_matches(MODULE_HOURS_RE, page_text)
-
-        if count == 0:
-            total = _sum_matches(MODULE_HOURS_FUZZY_RE, page_text)
-            count = _count_matches(MODULE_HOURS_FUZZY_RE, page_text)
-
-        if count > 0 and total > 0:
-            workload.update({"total_hours": total, "basis": "modules", "items": count})
-            return workload
-
-        m = GENERIC_HOURS_TO_COMPLETE_RE.search(page_text)
-        if m:
-            workload.update({"total_hours": float(m.group(1)), "basis": "hint"})
-        return workload
-
-    if is_spec or is_pro:
-        total = _sum_matches(COURSE_HOURS_RE, page_text)
-        count = _count_matches(COURSE_HOURS_RE, page_text)
-
-        if count == 0:
-            total = _sum_matches(COURSE_HOURS_FUZZY_RE, page_text)
-            count = _count_matches(COURSE_HOURS_FUZZY_RE, page_text)
-
-        if count > 0 and total > 0:
-            workload.update({"total_hours": total, "basis": "courses", "items": count})
-            return workload
-
-        m = GENERIC_HOURS_TO_COMPLETE_RE.search(page_text)
-        if m:
-            workload.update({"total_hours": float(m.group(1)), "basis": "hint"})
-        return workload
-
-    return workload
-
-def parse_title(soup: BeautifulSoup) -> str:
-    og = soup.find("meta", property="og:title")
-    if og and og.get("content"):
-        return og["content"].strip()
-    if soup.title and soup.title.text:
-        return soup.title.text.strip()
-    return "Coursera"
-
-def page_type(url: str) -> str:
-    if "/specializations/" in url:
-        return "Specialization"
-    if "/professional-certificates/" in url:
-        return "Professional Certificate"
-    return "Course"
-
-def fmt_hours(x: float) -> str:
-    if x is None:
-        return "-"
-    if abs(x - round(x)) < 1e-9:
-        return str(int(round(x)))
-    return f"{x:.1f}"
-
-def format_info(info: Dict[str, Any]) -> str:
-    title = info.get("title") or "Coursera"
-    kind = info.get("type") or "-"
-    url = info.get("url") or ""
-
-    lines: List[str] = []
-    lines.append(f"✅ {title}")
-    lines.append(f"Type: {kind}")
-
-    wl = info.get("workload") or {}
-    total = wl.get("total_hours")
-
-    if total is not None:
-        if wl.get("basis") == "modules":
-            lines.append(f"Total hours: {fmt_hours(total)} (sum of {wl.get('items')} modules)")
-        elif wl.get("basis") == "courses":
-            lines.append(f"Total hours: {fmt_hours(total)} (sum of {wl.get('items')} courses)")
+    if info.total_hours is not None:
+        if info.sum_basis == "modules":
+            parts.append(f"<b>Total hours:</b> {info.total_hours:g} (sum of {info.items_count} modules)")
+        elif info.sum_basis == "courses":
+            parts.append(f"<b>Total hours:</b> {info.total_hours:g} (sum of {info.items_count} courses)")
         else:
-            lines.append(f"Total hours: {fmt_hours(total)} (mentioned on page)")
-    else:
-        lines.append("Total hours: - (not found)")
+            parts.append(f"<b>Total hours:</b> {info.total_hours:g}")
+    elif info.workload_hint:
+        parts.append(f"<b>Workload hint:</b> {escape_html(info.workload_hint)}")
 
-    lines.append(f"Link: {url}")
-    lines.append("")
-    lines.append("ℹ️ Bot reads only publicly available information shown on the page.")
-    return "\n".join(lines)
+    if info.course_count is not None:
+        parts.append(f"<b>Courses in series:</b> {info.course_count}")
 
-WELCOME = (
-    "Hi! Send a Coursera link and I will return a short summary.\n\n"
-    "Supported:\n"
-    "• /learn/... (course)\n"
-    "• /specializations/... (specialization)\n"
-    "• /professional-certificates/... (professional certificate)\n"
-    "• /programs/.../learn|specializations|professional-certificates/... (program links)\n"
-)
+    parts.append(f"<b>Link:</b> {escape_html(info.url)}")
+    parts.append("<i>Note: best-effort, uses only public page content.</i>")
+    return "\n".join(parts)
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text(WELCOME)
+
+async def safe_reply(update: Update, text: str, **kwargs) -> None:
+    if not update.message:
+        return
+    for attempt in range(3):
+        try:
+            await update.message.reply_text(text, **kwargs)
+            return
+        except RetryAfter as e:
+            await asyncio.sleep(float(e.retry_after) + 0.5)
+        except (TimedOut, NetworkError):
+            await asyncio.sleep(1.0 + attempt)
+        except BadRequest:
+            if kwargs.get("parse_mode"):
+                kwargs.pop("parse_mode", None)
+                await update.message.reply_text(text)
+            return
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await safe_reply(update, START_TEXT, parse_mode=ParseMode.MARKDOWN)
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text(WELCOME)
+    await safe_reply(update, HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
 
-    url = normalize_url(update.message.text)
-    if not url:
-        await update.message.reply_text("Please send a valid Coursera link.")
+    text = update.message.text or ""
+    urls = re.findall(r"https?://\S+", text)
+    urls = [u.rstrip(").,]>'\"") for u in urls]
+
+    seen = set()
+    canon_urls = []
+    for u in urls:
+        cu = canonicalize_url(u)
+        if not cu:
+            continue
+        if cu not in seen:
+            seen.add(cu)
+            canon_urls.append(cu)
+
+    if not canon_urls:
+        await safe_reply(
+            update,
+            "Send me a Coursera link and I will summarize it.\n\n"
+            "Examples:\n"
+            "https://www.coursera.org/professional-certificates/adp-airs-entry-level-recruiter\n"
+            "https://www.coursera.org/specializations/jhu-data-science\n"
+            "https://www.coursera.org/learn/intro-fpga-design-embedded-systems/home/welcome\n\n"
+            "⏳ First request may take up to 1 minute.",
+        )
         return
 
-    await update.message.reply_text("⏳ Checking the page...")
+    canon_urls = canon_urls[:MAX_URLS_PER_MESSAGE]
+    status_msg = await update.message.reply_text("⏳ Checking the page...")
+
+    async def process_one(url: str) -> str:
+        if not is_supported_coursera_url(url):
+            return f"Unsupported link:\n{url}"
+        async with _fetch_sem:
+            try:
+                info = await asyncio.wait_for(asyncio.to_thread(get_course_info, url), timeout=FETCH_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                return f"❌ Timeout while reading:\n{url}"
+            except Exception:
+                logger.exception("Failed to parse url: %s", url)
+                return f"❌ Could not parse right now:\n{url}"
+        return format_info(info)
+
+    results = []
+    for u in canon_urls:
+        results.append(await process_one(u))
 
     try:
-        html = fetch_html(url)
-        soup = BeautifulSoup(html, "lxml")
-
-        info = {
-            "title": parse_title(soup),
-            "type": page_type(url),
-            "url": url,
-            "workload": parse_workload(url, soup),
-        }
-
-        await update.message.reply_text(format_info(info))
-    except requests.HTTPError:
-        await update.message.reply_text("❌ I could not access this page right now. Please try again later.")
+        await status_msg.edit_text("✅ Done. See results below.")
     except Exception:
-        logger.exception("Unexpected error while parsing")
-        await update.message.reply_text("❌ Something went wrong while parsing the page.")
+        pass
+
+    for msg in results:
+        await safe_reply(update, msg, parse_mode=ParseMode.HTML)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = context.error
+    if isinstance(err, Conflict):
+        logger.error("Telegram Conflict (two instances). Webhook mode avoids this on Render.")
+        return
+    logger.exception("Unhandled error: %s", err)
+    if isinstance(update, Update) and update.message:
+        await safe_reply(update, "❌ Unexpected error. Please try again.")
+
 
 def main() -> None:
-    load_dotenv()
     token = os.environ.get("TELEGRAM_TOKEN")
     if not token:
-        raise RuntimeError("TELEGRAM_TOKEN is not set. Add it in Render Environment Variables.")
+        raise SystemExit("Missing TELEGRAM_TOKEN. Set it in Render env vars or .env file.")
 
     app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(on_error)
 
-    logger.info("Bot started")
-    app.run_polling(close_loop=False)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    mode = os.environ.get("MODE", "auto").strip().lower()
+    base_url = (os.environ.get("WEBHOOK_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+    port = int(os.environ.get("PORT", "10000"))
+    url_path = os.environ.get("WEBHOOK_PATH", "telegram").strip("/")
+
+    # Start health server for Render if we are not using webhook
+    # (webhook binds the same port itself).
+    if not (mode in {"auto", "webhook"} and base_url) and os.environ.get("PORT"):
+        threading.Thread(target=_start_health_server, daemon=True).start()
+
+    if mode == "webhook" and not base_url:
+        raise SystemExit("MODE=webhook but WEBHOOK_BASE_URL/RENDER_EXTERNAL_URL is missing.")
+
+    if mode in {"auto", "webhook"} and base_url:
+        webhook_url = f"{base_url}/{url_path}"
+        logger.info("Starting in WEBHOOK mode: %s", webhook_url)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=url_path,
+            webhook_url=webhook_url,
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+            close_loop=False,
+        )
+        return
+
+    logger.info("Starting in POLLING mode")
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+        close_loop=False,
+    )
+
 
 if __name__ == "__main__":
+    load_dotenv()
     main()
