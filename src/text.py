@@ -13,7 +13,4 @@ HELP_TEXT = (
     "*How it works*\n"
     "- Send a Coursera link\n"
     "- I fetch the public page and try to extract title / type / total hours\n\n"
-    "*Notes*\n"
-    "- Best-effort: Coursera may change page layout\n"
-    "- No login, no payments, no certificates\n"
 )
