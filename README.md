@@ -85,6 +85,3 @@ docker run --rm -e TELEGRAM_TOKEN="YOUR_TOKEN_HERE" coursera-course-info-bot
 If you accidentally committed a secret (token), rotate it in BotFather and remove it from Git history.
 
 ---
-
-## License
-MIT (you can change/remove if you want).
